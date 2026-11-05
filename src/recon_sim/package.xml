@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>recon_sim</name>
+  <version>1.0.0</version>
+  <description>Gazebo Classic + ROS 2 Humble simulation of the Recon Mark 3 quadruped (8 servos + neck).</description>
+  <maintainer email="sasivisvan@gmail.com">Recon Sim</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>gazebo_dev</depend>
+  <depend>gazebo_ros</depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,5 @@
+# Passed to gzserver (gazebo_ros_init).  The default /clock rate is only 10 Hz, which would make every
+# node that uses sim time (our 100 Hz gait generator) tick at 10 Hz.
+gazebo:
+  ros__parameters:
+    publish_rate: 200.0

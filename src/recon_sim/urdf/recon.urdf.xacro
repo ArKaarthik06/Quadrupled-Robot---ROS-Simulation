@@ -1,0 +1,331 @@
+<?xml version="1.0"?>
+<!--
+  Recon Mark 3 quadruped (Otto-style, 8 x MG90S + neck servo).
+
+  Frame convention (REP-103):  x = forward (towards the head),  y = left,  z = up.
+
+  Kinematics (reconstructed from the firmware + calibration photos):
+    * Hip  servo: VERTICAL axis. Swings the femur arm forward/backwards (stride).
+    * Leg  servo: axis along the body x-axis at the end of the femur. Swings the leg
+                  sideways, which lifts / lowers the foot (the "z" motion in Recon.cpp).
+    * Every joint value is exactly   q = radians(servo_angle - 90),
+      so servo 90 deg = joint 0 = the "Calibration" photos, and the gait node can
+      publish the firmware numbers directly.  Joint axes below encode the mounting of the
+      four hip/leg servos.  They are chosen so that the firmware's user-facing commands
+      behave as named in Recon_3.0_main.ino gaits(): FORWARD = walk(0) moves the robot
+      towards +x (the head), BACKWARD = walk(1), turnL turns left, turnR turns right,
+      and the home pose (hips 90 +/- 20) splays the front femurs forward / rear ones back.
+
+  Servo index order (Recon.h):
+    0 FR_HIP  1 FL_HIP  2 FR_LEG  3 FL_LEG  4 BR_HIP  5 BL_HIP  6 BR_LEG  7 BL_LEG  (+8 NECK)
+
+  Colours: Gazebo Classic ignores URDF material colours, so every coloured part is its own
+  visual-only link joined with a fixed joint (sdformat lumps it back into the parent) and
+  gets a Gazebo material through <gazebo reference=...>.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="recon">
+
+  <!-- ===================== dimensions [m] (estimated from the photos / MG90S datasheet) ===================== -->
+  <xacro:property name="body_x" value="0.070"/>
+  <xacro:property name="body_y" value="0.050"/>
+  <xacro:property name="body_z" value="0.026"/>
+
+  <xacro:property name="hip_x" value="0.034"/>      <!-- hip shaft distance from body centre, along x -->
+  <xacro:property name="hip_y" value="0.022"/>      <!-- ... and along y -->
+  <xacro:property name="hip_z" value="0.0155"/>     <!-- height of the femur plane above body centre -->
+
+  <xacro:property name="femur"   value="0.043"/>    <!-- hip shaft -> leg-servo shaft, horizontal -->
+  <xacro:property name="leg_dz"  value="-0.012"/>   <!-- leg-servo shaft is this much below the femur plane -->
+  <xacro:property name="leg_off" value="0.0165"/>   <!-- leg plate sits in front of (back of) the leg servo -->
+  <xacro:property name="leg_len" value="0.042"/>    <!-- leg-servo shaft -> foot ball centre -->
+  <xacro:property name="foot_r"  value="0.005"/>
+
+  <xacro:property name="neck_z"  value="0.0275"/>
+
+  <!-- Centre of mass of the chassis (the 2x18650 pack sits towards the rear).  With the walk-gait
+       stance offsets the two foot diagonals cross ~5 mm behind the body centre; putting the CoM
+       there lets the robot balance on either diagonal so the trot can alternate. -->
+  <xacro:property name="com_x" value="-0.005"/>
+
+  <!-- MG90S: 22.8 x 12.2 x 28.5 mm, 13.4 g, ~0.22 N.m, ~10 rad/s -->
+  <xacro:property name="servo_effort" value="0.22"/>
+  <xacro:property name="servo_vel"    value="10.0"/>
+  <xacro:property name="lim" value="${pi/2}"/>
+
+  <xacro:property name="jfriction" value="0.02"/>   <!-- gear friction: keeps the legs from flopping before the commands start -->
+  <xacro:property name="jdamping"  value="0.002"/>
+
+  <!-- Gazebo material names -->
+  <xacro:property name="m_body"  value="Gazebo/Blue"/>
+  <xacro:property name="m_head"  value="Gazebo/SkyBlue"/>
+  <xacro:property name="m_servo" value="Gazebo/FlatBlack"/>
+  <xacro:property name="m_dark"  value="Gazebo/DarkGrey"/>
+  <xacro:property name="m_white" value="Gazebo/White"/>
+  <xacro:property name="m_black" value="Gazebo/Black"/>
+
+  <!-- ===================== helpers ===================== -->
+  <xacro:macro name="box_inertial" params="m x y z *origin">
+    <inertial>
+      <xacro:insert_block name="origin"/>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(y*y+z*z)/12}" ixy="0" ixz="0"
+               iyy="${m*(x*x+z*z)/12}" iyz="0"
+               izz="${m*(x*x+y*y)/12}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- visual-only coloured part, fixed to `parent` -->
+  <xacro:macro name="part" params="name parent mat xyz rpy:='0 0 0' *geometry">
+    <link name="${name}">
+      <visual><xacro:insert_block name="geometry"/></visual>
+    </link>
+    <joint name="${name}_fixed" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+    </joint>
+    <gazebo reference="${name}"><material>${mat}</material></gazebo>
+  </xacro:macro>
+
+  <!-- ===================== body ===================== -->
+  <link name="base_link">
+    <visual>
+      <geometry><box size="${body_x} ${body_y} ${body_z}"/></geometry>
+    </visual>
+    <collision>
+      <geometry><box size="${body_x} ${body_y} ${body_z}"/></geometry>
+    </collision>
+    <!-- chassis + 2x18650 + ESP32 + 5 hip/neck servos -->
+    <xacro:box_inertial m="0.170" x="${body_x}" y="${body_y}" z="${body_z}">
+      <origin xyz="${com_x} 0 0"/>
+    </xacro:box_inertial>
+  </link>
+  <gazebo reference="base_link"><material>${m_body}</material></gazebo>
+
+  <!-- 4 hip servos (stand upright, shaft up) and the neck servo -->
+  <xacro:macro name="hip_servo" params="name x y">
+    <xacro:part name="${name}" parent="base_link" mat="${m_servo}" xyz="${x} ${y} 0">
+      <geometry><box size="0.0122 0.0227 0.0285"/></geometry>
+    </xacro:part>
+  </xacro:macro>
+  <xacro:hip_servo name="servo_fr" x="${hip_x}"  y="-0.016"/>
+  <xacro:hip_servo name="servo_fl" x="${hip_x}"  y="0.016"/>
+  <xacro:hip_servo name="servo_br" x="${-hip_x}" y="-0.016"/>
+  <xacro:hip_servo name="servo_bl" x="${-hip_x}" y="0.016"/>
+  <xacro:part name="servo_neck" parent="base_link" mat="${m_servo}" xyz="0 0 ${body_z/2 + 0.0095}">
+    <geometry><box size="0.0122 0.0227 0.019"/></geometry>
+  </xacro:part>
+
+  <!-- ===================== head (neck servo + box with eyes) ===================== -->
+  <link name="head_link">
+    <visual>
+      <origin xyz="0 0 0.0115"/>
+      <geometry><box size="0.032 0.072 0.034"/></geometry>
+    </visual>
+    <xacro:box_inertial m="0.035" x="0.032" y="0.072" z="0.034">
+      <origin xyz="0 0 0.0115"/>
+    </xacro:box_inertial>
+  </link>
+  <gazebo reference="head_link"><material>${m_head}</material></gazebo>
+
+  <joint name="neck_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="head_link"/>
+    <origin xyz="0 0 ${neck_z}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.2" upper="1.2" effort="${servo_effort}" velocity="${servo_vel}"/>
+    <dynamics damping="${jdamping}" friction="${jfriction}"/>
+  </joint>
+
+  <xacro:part name="neck_horn" parent="head_link" mat="${m_dark}" xyz="0 0 0.002">
+    <geometry><cylinder radius="0.007" length="0.006"/></geometry>
+  </xacro:part>
+  <xacro:part name="eye_l" parent="head_link" mat="${m_white}" xyz="0.0165 0.0185 0.0135">
+    <geometry><sphere radius="0.0095"/></geometry>
+  </xacro:part>
+  <xacro:part name="eye_r" parent="head_link" mat="${m_white}" xyz="0.0165 -0.0185 0.0135">
+    <geometry><sphere radius="0.0095"/></geometry>
+  </xacro:part>
+  <xacro:part name="pupil_l" parent="head_link" mat="${m_black}" xyz="0.0235 0.0185 0.0135">
+    <geometry><sphere radius="0.0048"/></geometry>
+  </xacro:part>
+  <xacro:part name="pupil_r" parent="head_link" mat="${m_black}" xyz="0.0235 -0.0185 0.0135">
+    <geometry><sphere radius="0.0048"/></geometry>
+  </xacro:part>
+  <xacro:part name="brow" parent="head_link" mat="${m_body}" xyz="0.0165 0 0.0295">
+    <geometry><box size="0.002 0.040 0.004"/></geometry>
+  </xacro:part>
+
+  <!-- ===================== one leg: hip servo + femur + leg servo + leg ===================== -->
+  <!--  s  = +1 left / -1 right      fb = +1 front / -1 back
+        hip axis  : always +z   (all four hip servos turn the same way, counter-clockwise seen from above)
+        leg axis  : +x on the front legs, -x on the back legs                                       -->
+  <xacro:macro name="leg" params="name px py s fb">
+
+    <link name="${name}_hip_link">
+      <visual>   <!-- horn + femur arm -->
+        <origin xyz="0 ${s*femur/2} 0.002"/>
+        <geometry><box size="0.012 ${femur+0.012} 0.004"/></geometry>
+      </visual>
+      <xacro:box_inertial m="0.026" x="0.028" y="0.05" z="0.02">
+        <origin xyz="0 ${s*femur*0.8} -0.004"/>
+      </xacro:box_inertial>
+    </link>
+    <gazebo reference="${name}_hip_link"><material>${m_body}</material></gazebo>
+
+    <joint name="${name}_hip_joint" type="revolute">
+      <parent link="base_link"/>
+      <child link="${name}_hip_link"/>
+      <origin xyz="${px*hip_x} ${py*hip_y} ${hip_z}"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${-lim}" upper="${lim}" effort="${servo_effort}" velocity="${servo_vel}"/>
+      <dynamics damping="${jdamping}" friction="${jfriction}"/>
+    </joint>
+
+    <!-- leg servo (shaft along x) and the U bracket joining it to the femur -->
+    <xacro:part name="${name}_servo" parent="${name}_hip_link" mat="${m_servo}"
+                xyz="${-fb*0.002} ${s*femur} ${leg_dz}">
+      <geometry><box size="0.0285 0.0122 0.0227"/></geometry>
+    </xacro:part>
+    <xacro:part name="${name}_bracket" parent="${name}_hip_link" mat="${m_dark}"
+                xyz="0 ${s*(femur+0.0075)} ${leg_dz/2}">
+      <geometry><box size="0.012 0.003 ${-leg_dz+0.004}"/></geometry>
+    </xacro:part>
+
+    <link name="${name}_leg_link">
+      <visual>   <!-- leg plate -->
+        <origin xyz="${fb*leg_off} 0 ${-leg_len/2}"/>
+        <geometry><box size="0.004 0.012 ${leg_len}"/></geometry>
+      </visual>
+      <collision>
+        <origin xyz="${fb*leg_off} 0 ${-leg_len}"/>
+        <geometry><sphere radius="${foot_r}"/></geometry>
+      </collision>
+      <collision>
+        <origin xyz="${fb*leg_off} 0 ${-leg_len/2}"/>
+        <geometry><box size="0.004 0.012 ${leg_len}"/></geometry>
+      </collision>
+      <xacro:box_inertial m="0.010" x="0.004" y="0.012" z="${leg_len}">
+        <origin xyz="${fb*leg_off} 0 ${-leg_len/2}"/>
+      </xacro:box_inertial>
+    </link>
+
+    <joint name="${name}_leg_joint" type="revolute">
+      <parent link="${name}_hip_link"/>
+      <child link="${name}_leg_link"/>
+      <origin xyz="0 ${s*femur} ${leg_dz}"/>
+      <axis xyz="${fb} 0 0"/>
+      <limit lower="${-lim}" upper="${lim}" effort="${servo_effort}" velocity="${servo_vel}"/>
+      <dynamics damping="${jdamping}" friction="${jfriction}"/>
+    </joint>
+
+    <xacro:part name="${name}_horn" parent="${name}_leg_link" mat="${m_dark}" xyz="${fb*leg_off} 0 0"
+                rpy="0 ${pi/2} 0">
+      <geometry><cylinder radius="0.008" length="0.004"/></geometry>
+    </xacro:part>
+    <xacro:part name="${name}_foot" parent="${name}_leg_link" mat="${m_black}" xyz="${fb*leg_off} 0 ${-leg_len}">
+      <geometry><sphere radius="${foot_r}"/></geometry>
+    </xacro:part>
+
+    <gazebo reference="${name}_leg_link">
+      <material>${m_body}</material>
+      <mu1>1.2</mu1>
+      <mu2>1.2</mu2>
+      <kp>200000.0</kp>
+      <kd>10.0</kd>
+      <minDepth>0.0003</minDepth>
+      <maxVel>0.05</maxVel>
+    </gazebo>
+  </xacro:macro>
+
+  <xacro:leg name="front_right" px="1"  py="-1" s="-1" fb="1"/>
+  <xacro:leg name="front_left"  px="1"  py="1"  s="1"  fb="1"/>
+  <xacro:leg name="back_right"  px="-1" py="-1" s="-1" fb="-1"/>
+  <xacro:leg name="back_left"   px="-1" py="1"  s="1"  fb="-1"/>
+
+  <!-- ===================== sensors (massless, so the gait balance is unchanged) ===================== -->
+  <!-- 2D lidar on a post at the rear, above the head so it can see all around.  Range is limited to
+       2 m: the body rocks a few degrees while walking and a longer range would hit the floor. -->
+  <xacro:part name="laser_post" parent="base_link" mat="${m_dark}" xyz="-0.025 0 0.044">
+    <geometry><cylinder radius="0.004" length="0.062"/></geometry>
+  </xacro:part>
+  <link name="laser_link">
+    <visual><geometry><cylinder radius="0.018" length="0.012"/></geometry></visual>
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/><child link="laser_link"/><origin xyz="-0.025 0 0.08"/>
+  </joint>
+  <gazebo reference="laser_link">
+    <material>${m_servo}</material>
+    <sensor name="lidar" type="ray">
+      <always_on>true</always_on><visualize>false</visualize><update_rate>8</update_rate>
+      <ray>
+        <scan><horizontal><samples>360</samples><resolution>1</resolution>
+          <min_angle>-3.14159</min_angle><max_angle>3.14159</max_angle></horizontal></scan>
+        <range><min>0.10</min><max>2.0</max><resolution>0.01</resolution></range>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.004</stddev></noise>
+      </ray>
+      <plugin name="lidar_plugin" filename="libgazebo_ros_ray_sensor.so">
+        <ros><remapping>~/out:=scan</remapping></ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>laser_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- camera between the eyes: this is "what the robot sees" -->
+  <link name="camera_link">
+    <visual><geometry><box size="0.004 0.010 0.008"/></geometry></visual>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="head_link"/><child link="camera_link"/><origin xyz="0.0175 0 0.0135"/>
+  </joint>
+  <gazebo reference="camera_link">
+    <material>${m_black}</material>
+    <sensor name="camera" type="camera">
+      <always_on>true</always_on><update_rate>10</update_rate>
+      <camera>
+        <horizontal_fov>1.4</horizontal_fov>
+        <image><width>320</width><height>240</height><format>R8G8B8</format></image>
+        <clip><near>0.02</near><far>8.0</far></clip>
+      </camera>
+      <plugin name="camera_plugin" filename="libgazebo_ros_camera.so">
+        <camera_name>camera</camera_name>
+        <frame_name>camera_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- IMU in the body -->
+  <gazebo reference="base_link">
+    <sensor name="imu" type="imu">
+      <always_on>true</always_on><update_rate>50</update_rate>
+      <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+        <ros><remapping>~/out:=imu</remapping></ros>
+        <frame_name>base_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- ===================== servo model ===================== -->
+  <!-- recon_servo_plugin: every joint is a torque-limited PD servo (MG90S ~0.22 N.m).
+       Commands: /recon/joint_commands (Float64MultiArray, rad, order = the <joint> list below,
+       i.e. the servo index order of Recon.h + neck).  Joint states: /joint_states. -->
+  <gazebo>
+    <plugin name="recon_servos" filename="librecon_servo_plugin.so">
+      <kp>1.5</kp>
+      <kd>0.007</kd>
+      <max_torque>0.25</max_torque>
+      <joint>front_right_hip_joint</joint>
+      <joint>front_left_hip_joint</joint>
+      <joint>front_right_leg_joint</joint>
+      <joint>front_left_leg_joint</joint>
+      <joint>back_right_hip_joint</joint>
+      <joint>back_left_hip_joint</joint>
+      <joint>back_right_leg_joint</joint>
+      <joint>back_left_leg_joint</joint>
+      <joint>neck_joint</joint>
+    </plugin>
+  </gazebo>
+
+</robot>
